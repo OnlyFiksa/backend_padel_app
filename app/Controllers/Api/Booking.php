@@ -3,128 +3,78 @@ namespace App\Controllers\Api;
 
 use CodeIgniter\RESTful\ResourceController;
 use App\Models\BookingModel;
-use App\Models\BookingDetailModel;
-use App\Models\ScheduleModel;
 
 class Booking extends ResourceController
 {
-    protected $format = 'json';
-
-    // 1. Membuat Pesanan Baru
     public function create()
     {
         $db = \Config\Database::connect();
         $bookingModel = new BookingModel();
-        $detailModel = new BookingDetailModel();
-        $scheduleModel = new ScheduleModel();
+        
+        $json = $this->request->getJSON();
+        $userId      = $json->user_id ?? $this->request->getVar('user_id');
+        $courtId     = $json->court_id ?? $this->request->getVar('court_id') ?? 1;
+        $bookingDate = $json->booking_date ?? $this->request->getVar('booking_date');
+        $startTime   = $json->start_time ?? $this->request->getVar('start_time');
+        $duration    = $json->duration ?? $this->request->getVar('duration');
+        $totalAmount = $json->total_amount ?? $this->request->getVar('total_amount');
 
-        $userId     = $this->request->getVar('user_id');
-        $courtId    = $this->request->getVar('court_id');
-        $scheduleId = $this->request->getVar('schedule_id');
-        $bookingDate = $this->request->getVar('booking_date'); // Format: YYYY-MM-DD
+        // Validasi Anti-Double Booking yang Super Akurat
+        $startHour = (int)substr($startTime, 0, 2);
+        $endHour = $startHour + ($duration / 60);
 
-        // VALIDASI 1: Cek Double Booking
-        // Cek apakah di tanggal dan jam tersebut lapangan sudah di-booking orang lain
-        $isBooked = $db->table('booking_details')
-                       ->join('bookings', 'bookings.id = booking_details.booking_id')
-                       ->where('bookings.booking_date', $bookingDate)
-                       ->where('booking_details.court_id', $courtId)
-                       ->where('booking_details.schedule_id', $scheduleId)
-                       ->where('bookings.status', 'Active')
-                       ->countAllResults();
+        $existingBookings = $db->table('bookings')
+            ->where('booking_date', $bookingDate)
+            ->where('court_id', $courtId)
+            ->whereIn('status', ['Active', 'Completed'])
+            ->get()->getResultArray();
 
-        if ($isBooked > 0) {
-            return $this->fail('Maaf, jadwal ini sudah dipesan orang lain. Silakan pilih jam lain.');
+        foreach ($existingBookings as $b) {
+            $bStart = (int)substr($b['start_time'], 0, 2);
+            $bEnd = $bStart + ($b['duration'] / 60);
+            
+            // Logika Tabrakan
+            if (max($startHour, $bStart) < min($endHour, $bEnd)) {
+                return $this->fail('Maaf, jam dalam durasi ini sudah dipesan orang lain.');
+            }
         }
 
-        // Ambil harga dari tabel schedules
-        $schedule = $scheduleModel->find($scheduleId);
-        $totalAmount = $schedule['price'];
-
-        // Generate Order ID (Contoh: PDL-20260315-RANDOM)
         $orderId = 'PDL-' . date('Ymd', strtotime($bookingDate)) . '-' . rand(1000, 9999);
 
-        // Mulai Transaksi Database (Mencegah data setengah masuk kalau error)
-        $db->transStart();
+        // Langsung Insert 1 Baris Saja! (Nggak perlu tabel details)
+        $bookingModel->insert([
+            'user_id' => $userId, 'court_id' => $courtId, 'order_id' => $orderId,
+            'booking_date' => $bookingDate, 'start_time' => $startTime,
+            'duration' => $duration, 'total_amount' => $totalAmount,
+            'status' => 'Active', 'payment_method' => 'QRIS'
+        ]);
 
-        // Insert ke tabel bookings (Header)
-        $bookingData = [
-            'user_id'        => $userId,
-            'order_id'       => $orderId,
-            'booking_date'   => $bookingDate,
-            'total_amount'   => $totalAmount,
-            'status'         => 'Active',
-            'payment_method' => 'Pay at Venue'
-        ];
-        $bookingModel->insert($bookingData);
-        $newBookingId = $bookingModel->getInsertID();
-
-        // Insert ke tabel booking_details (Isi Pesanan)
-        $detailData = [
-            'booking_id'  => $newBookingId,
-            'court_id'    => $courtId,
-            'schedule_id' => $scheduleId
-        ];
-        $detailModel->insert($detailData);
-
-        $db->transComplete();
-
-        if ($db->transStatus() === false) {
-            return $this->failServerError('Terjadi kesalahan saat memproses pesanan.');
-        }
+        // BUG PROMO SOLVED: Tandai user ini sudah pernah booking (Hanguskan promonya!) 🔥
+        $db->table('users')->where('id', $userId)->update(['has_used_promo' => 1]);
 
         return $this->respondCreated([
-            'status'  => 201,
-            'message' => 'Pesanan berhasil dibuat! Bayar di lokasi.',
-            'data'    => ['order_id' => $orderId]
+            'status' => 201, 'message' => 'Pesanan berhasil!', 'data' => ['order_id' => $orderId]
         ]);
     }
 
-    // 2. Menampilkan Riwayat Pesanan User (Untuk Bottom Navbar)
     public function getUserBookings($userId = null)
     {
         $db = \Config\Database::connect();
-        
-        // Mengambil data pesanan beserta detail GOR-nya
-        $bookings = $db->table('bookings')
-                       ->select('bookings.*, courts.court_number, venues.name as venue_name, schedules.start_time, schedules.end_time')
-                       ->join('booking_details', 'booking_details.booking_id = bookings.id')
-                       ->join('courts', 'courts.id = booking_details.court_id')
-                       ->join('venues', 'venues.id = courts.venue_id')
-                       ->join('schedules', 'schedules.id = booking_details.schedule_id')
-                       ->where('bookings.user_id', $userId)
-                       ->orderBy('bookings.booking_date', 'DESC')
-                       ->get()
-                       ->getResultArray();
+        $bookings = $db->table('bookings b')
+                       ->select('b.*, c.court_number, v.name as venue_name')
+                       ->join('courts c', 'c.id = b.court_id', 'left')
+                       ->join('venues v', 'v.id = c.venue_id', 'left')
+                       ->where('b.user_id', $userId)
+                       ->orderBy('b.booking_date', 'DESC')
+                       ->get()->getResultArray();
 
         return $this->respond(['status' => 200, 'data' => $bookings]);
     }
 
-    // 3. Batalkan Pesanan (Dengan Validasi H-1)
     public function cancelBooking($bookingId = null)
     {
         $bookingModel = new BookingModel();
-        $booking = $bookingModel->find($bookingId);
-
-        if (!$booking) {
-            return $this->failNotFound('Pesanan tidak ditemukan.');
-        }
-
-        // VALIDASI 2: Cek Aturan H-1
-        $bookingDate = strtotime($booking['booking_date']);
-        $today = strtotime(date('Y-m-d')); // Waktu hari ini tanpa jam
-
-        // Jika hari ini sudah sama dengan atau melewati tanggal booking
-        if ($today >= $bookingDate) {
-            return $this->fail('Pesanan tidak dapat dibatalkan. Pembatalan maksimal dilakukan H-1.');
-        }
-
-        // Jika lolos validasi, ubah status jadi Cancelled
         $bookingModel->update($bookingId, ['status' => 'Cancelled']);
-
-        return $this->respond([
-            'status'  => 200,
-            'message' => 'Pesanan berhasil dibatalkan.'
-        ]);
+        return $this->respond(['status' => 200, 'message' => 'Pesanan dibatalkan.']);
     }
 }
